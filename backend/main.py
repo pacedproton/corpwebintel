@@ -1,562 +1,84 @@
-from contextlib import asynccontextmanager
-from bs4 import BeautifulSoup
-import json
-import markdown
-import time
-import os
-import sys
-import logging
-import aiohttp
-import requests
-import mimetypes
-import shutil
-import os
-import inspect
-import asyncio
-
-from fastapi import FastAPI, Request, Depends, status, UploadFile, File, Form
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
-from fastapi import HTTPException
-from fastapi.middleware.wsgi import WSGIMiddleware
+from fastapi import (
+    FastAPI,
+    Request,
+    Response,
+    HTTPException,
+    Depends,
+    status,
+    UploadFile,
+    File,
+    BackgroundTasks,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse
+from fastapi.concurrency import run_in_threadpool
 
+from pydantic import BaseModel, ConfigDict
 
-from apps.socket.main import app as socket_app
-from apps.ollama.main import (
-    app as ollama_app,
-    OpenAIChatCompletionForm,
-    get_all_models as get_ollama_models,
-    generate_openai_chat_completion as generate_ollama_chat_completion,
-)
-from apps.openai.main import (
-    app as openai_app,
-    get_all_models as get_openai_models,
-    generate_chat_completion as generate_openai_chat_completion,
-)
+import os
+import re
+import copy
+import random
+import requests
+import json
+import uuid
+import aiohttp
+import asyncio
+import logging
+import time
+from urllib.parse import urlparse
+from typing import Optional, List, Union
 
-from apps.audio.main import app as audio_app
-from apps.images.main import app as images_app
-from apps.rag.main import app as rag_app
-from apps.webui.main import app as webui_app
+from starlette.background import BackgroundTask
 
-
-from pydantic import BaseModel
-from typing import List, Optional
-
-from apps.webui.models.models import Models, ModelModel
-from apps.webui.models.tools import Tools
-from apps.webui.utils import load_toolkit_module_by_id
-
-
+from apps.webui.models.models import Models
+from apps.webui.models.users import Users
+from constants import ERROR_MESSAGES
 from utils.utils import (
-    get_admin_user,
-    get_verified_user,
+    decode_token,
     get_current_user,
-    get_http_authorization_cred,
+    get_verified_user,
+    get_admin_user,
 )
-from utils.task import (
-    title_generation_template,
-    search_query_generation_template,
-    tools_function_calling_generation_template,
-)
-from utils.misc import get_last_user_message, add_or_update_system_message
 
-from apps.rag.utils import get_rag_context, rag_template
 
 from config import (
-    CONFIG_DATA,
-    WEBUI_NAME,
-    WEBUI_URL,
-    WEBUI_AUTH,
-    ENV,
-    VERSION,
-    CHANGELOG,
-    FRONTEND_BUILD_DIR,
-    CACHE_DIR,
-    STATIC_DIR,
-    ENABLE_OPENAI_API,
+    SRC_LOG_LEVELS,
+    OLLAMA_BASE_URLS,
     ENABLE_OLLAMA_API,
+    AIOHTTP_CLIENT_TIMEOUT,
     ENABLE_MODEL_FILTER,
     MODEL_FILTER_LIST,
-    GLOBAL_LOG_LEVEL,
-    SRC_LOG_LEVELS,
-    WEBHOOK_URL,
-    ENABLE_ADMIN_EXPORT,
-    WEBUI_BUILD_HASH,
-    TASK_MODEL,
-    TASK_MODEL_EXTERNAL,
-    TITLE_GENERATION_PROMPT_TEMPLATE,
-    SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE,
-    SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD,
-    TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
+    UPLOAD_DIR,
     AppConfig,
 )
-from constants import ERROR_MESSAGES
+from utils.misc import calculate_sha256
 
-logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
-log.setLevel(SRC_LOG_LEVELS["MAIN"])
+log.setLevel(SRC_LOG_LEVELS["OLLAMA"])
 
-
-class SPAStaticFiles(StaticFiles):
-    async def get_response(self, path: str, scope):
-        try:
-            return await super().get_response(path, scope)
-        except (HTTPException, StarletteHTTPException) as ex:
-            if ex.status_code == 404:
-                return await super().get_response("index.html", scope)
-            else:
-                raise ex
-
-
-print(
-    rf"""
-  ___                    __        __   _     _   _ ___ 
- / _ \ _ __   ___ _ __   \ \      / /__| |__ | | | |_ _|
-| | | | '_ \ / _ \ '_ \   \ \ /\ / / _ \ '_ \| | | || | 
-| |_| | |_) |  __/ | | |   \ V  V /  __/ |_) | |_| || | 
- \___/| .__/ \___|_| |_|    \_/\_/ \___|_.__/ \___/|___|
-      |_|                                               
-
-      
-v{VERSION} - building the best open-source AI user interface.
-{f"Commit: {WEBUI_BUILD_HASH}" if WEBUI_BUILD_HASH != "dev-build" else ""}
-https://github.com/open-webui/open-webui
-"""
-)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
-
-
-app = FastAPI(
-    docs_url="/docs" if ENV == "dev" else None, redoc_url=None, lifespan=lifespan
-)
-
-app.state.config = AppConfig()
-
-app.state.config.ENABLE_OPENAI_API = ENABLE_OPENAI_API
-app.state.config.ENABLE_OLLAMA_API = ENABLE_OLLAMA_API
-
-app.state.config.ENABLE_MODEL_FILTER = ENABLE_MODEL_FILTER
-app.state.config.MODEL_FILTER_LIST = MODEL_FILTER_LIST
-
-app.state.config.WEBHOOK_URL = WEBHOOK_URL
-
-
-app.state.config.TASK_MODEL = TASK_MODEL
-app.state.config.TASK_MODEL_EXTERNAL = TASK_MODEL_EXTERNAL
-app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE = TITLE_GENERATION_PROMPT_TEMPLATE
-app.state.config.SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE = (
-    SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE
-)
-app.state.config.SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD = (
-    SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD
-)
-app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE = (
-    TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
-)
-
-app.state.MODELS = {}
-
-origins = ["*"]
-
-
-async def get_function_call_response(messages, tool_id, template, task_model_id, user):
-    tool = Tools.get_tool_by_id(tool_id)
-    tools_specs = json.dumps(tool.specs, indent=2)
-    content = tools_function_calling_generation_template(template, tools_specs)
-
-    user_message = get_last_user_message(messages)
-    prompt = (
-        "History:\n"
-        + "\n".join(
-            [
-                f"{message['role'].upper()}: \"\"\"{message['content']}\"\"\""
-                for message in messages[::-1][:4]
-            ]
-        )
-        + f"\nQuery: {user_message}"
-    )
-
-    print(prompt)
-
-    payload = {
-        "model": task_model_id,
-        "messages": [
-            {"role": "system", "content": content},
-            {"role": "user", "content": f"Query: {prompt}"},
-        ],
-        "stream": False,
-    }
-
-    try:
-        payload = filter_pipeline(payload, user)
-    except Exception as e:
-        raise e
-
-    model = app.state.MODELS[task_model_id]
-
-    response = None
-    try:
-        if model["owned_by"] == "ollama":
-            response = await generate_ollama_chat_completion(
-                OpenAIChatCompletionForm(**payload), user=user
-            )
-        else:
-            response = await generate_openai_chat_completion(payload, user=user)
-
-        content = None
-
-        if hasattr(response, "body_iterator"):
-            async for chunk in response.body_iterator:
-                data = json.loads(chunk.decode("utf-8"))
-                content = data["choices"][0]["message"]["content"]
-
-            # Cleanup any remaining background tasks if necessary
-            if response.background is not None:
-                await response.background()
-        else:
-            content = response["choices"][0]["message"]["content"]
-
-        # Parse the function response
-        if content is not None:
-            print(f"content: {content}")
-            result = json.loads(content)
-            print(result)
-
-            # Call the function
-            if "name" in result:
-                if tool_id in webui_app.state.TOOLS:
-                    toolkit_module = webui_app.state.TOOLS[tool_id]
-                else:
-                    toolkit_module = load_toolkit_module_by_id(tool_id)
-                    webui_app.state.TOOLS[tool_id] = toolkit_module
-
-                function = getattr(toolkit_module, result["name"])
-                function_result = None
-                try:
-                    # Get the signature of the function
-                    sig = inspect.signature(function)
-                    # Check if '__user__' is a parameter of the function
-                    if "__user__" in sig.parameters:
-                        # Call the function with the '__user__' parameter included
-                        function_result = function(
-                            **{
-                                **result["parameters"],
-                                "__user__": {
-                                    "id": user.id,
-                                    "email": user.email,
-                                    "name": user.name,
-                                    "role": user.role,
-                                },
-                            }
-                        )
-                    else:
-                        # Call the function without modifying the parameters
-                        function_result = function(**result["parameters"])
-                except Exception as e:
-                    print(e)
-
-                # Add the function result to the system prompt
-                if function_result:
-                    return function_result
-    except Exception as e:
-        print(f"Error: {e}")
-
-    return None
-
-
-class ChatCompletionMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        return_citations = False
-
-        if request.method == "POST" and (
-            "/ollama/api/chat" in request.url.path
-            or "/chat/completions" in request.url.path
-        ):
-            log.debug(f"request.url.path: {request.url.path}")
-
-            # Read the original request body
-            body = await request.body()
-            # Decode body to string
-            body_str = body.decode("utf-8")
-            # Parse string to JSON
-            data = json.loads(body_str) if body_str else {}
-
-            user = get_current_user(
-                get_http_authorization_cred(request.headers.get("Authorization"))
-            )
-
-            # Remove the citations from the body
-            return_citations = data.get("citations", False)
-            if "citations" in data:
-                del data["citations"]
-
-            # Set the task model
-            task_model_id = data["model"]
-            if task_model_id not in app.state.MODELS:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Model not found",
-                )
-
-            # Check if the user has a custom task model
-            # If the user has a custom task model, use that model
-            if app.state.MODELS[task_model_id]["owned_by"] == "ollama":
-                if (
-                    app.state.config.TASK_MODEL
-                    and app.state.config.TASK_MODEL in app.state.MODELS
-                ):
-                    task_model_id = app.state.config.TASK_MODEL
-            else:
-                if (
-                    app.state.config.TASK_MODEL_EXTERNAL
-                    and app.state.config.TASK_MODEL_EXTERNAL in app.state.MODELS
-                ):
-                    task_model_id = app.state.config.TASK_MODEL_EXTERNAL
-
-            prompt = get_last_user_message(data["messages"])
-            context = ""
-
-            # If tool_ids field is present, call the functions
-            if "tool_ids" in data:
-                print(data["tool_ids"])
-                for tool_id in data["tool_ids"]:
-                    print(tool_id)
-                    try:
-                        response = await get_function_call_response(
-                            messages=data["messages"],
-                            tool_id=tool_id,
-                            template=app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
-                            task_model_id=task_model_id,
-                            user=user,
-                        )
-
-                        if response:
-                            context += ("\n" if context != "" else "") + response
-                    except Exception as e:
-                        print(f"Error: {e}")
-                del data["tool_ids"]
-
-                print(f"tool_context: {context}")
-
-            # If docs field is present, generate RAG completions
-            if "docs" in data:
-                data = {**data}
-                rag_context, citations = get_rag_context(
-                    docs=data["docs"],
-                    messages=data["messages"],
-                    embedding_function=rag_app.state.EMBEDDING_FUNCTION,
-                    k=rag_app.state.config.TOP_K,
-                    reranking_function=rag_app.state.sentence_transformer_rf,
-                    r=rag_app.state.config.RELEVANCE_THRESHOLD,
-                    hybrid_search=rag_app.state.config.ENABLE_RAG_HYBRID_SEARCH,
-                )
-
-                if rag_context:
-                    context += ("\n" if context != "" else "") + rag_context
-
-                del data["docs"]
-
-                log.debug(f"rag_context: {rag_context}, citations: {citations}")
-
-            if context != "":
-                system_prompt = rag_template(
-                    rag_app.state.config.RAG_TEMPLATE, context, prompt
-                )
-
-                print(system_prompt)
-
-                data["messages"] = add_or_update_system_message(
-                    f"\n{system_prompt}", data["messages"]
-                )
-
-            modified_body_bytes = json.dumps(data).encode("utf-8")
-
-            # Replace the request body with the modified one
-            request._body = modified_body_bytes
-            # Set custom header to ensure content-length matches new body length
-            request.headers.__dict__["_list"] = [
-                (b"content-length", str(len(modified_body_bytes)).encode("utf-8")),
-                *[
-                    (k, v)
-                    for k, v in request.headers.raw
-                    if k.lower() != b"content-length"
-                ],
-            ]
-
-        response = await call_next(request)
-
-        if return_citations:
-            # Inject the citations into the response
-            if isinstance(response, StreamingResponse):
-                # If it's a streaming response, inject it as SSE event or NDJSON line
-                content_type = response.headers.get("Content-Type")
-                if "text/event-stream" in content_type:
-                    return StreamingResponse(
-                        self.openai_stream_wrapper(response.body_iterator, citations),
-                    )
-                if "application/x-ndjson" in content_type:
-                    return StreamingResponse(
-                        self.ollama_stream_wrapper(response.body_iterator, citations),
-                    )
-
-        return response
-
-    async def _receive(self, body: bytes):
-        return {"type": "http.request", "body": body, "more_body": False}
-
-    async def openai_stream_wrapper(self, original_generator, citations):
-        yield f"data: {json.dumps({'citations': citations})}\n\n"
-        async for data in original_generator:
-            yield data
-
-    async def ollama_stream_wrapper(self, original_generator, citations):
-        yield f"{json.dumps({'citations': citations})}\n"
-        async for data in original_generator:
-            yield data
-
-
-app.add_middleware(ChatCompletionMiddleware)
-
-
-def filter_pipeline(payload, user):
-    user = {"id": user.id, "name": user.name, "role": user.role}
-    model_id = payload["model"]
-    filters = [
-        model
-        for model in app.state.MODELS.values()
-        if "pipeline" in model
-        and "type" in model["pipeline"]
-        and model["pipeline"]["type"] == "filter"
-        and (
-            model["pipeline"]["pipelines"] == ["*"]
-            or any(
-                model_id == target_model_id
-                for target_model_id in model["pipeline"]["pipelines"]
-            )
-        )
-    ]
-    sorted_filters = sorted(filters, key=lambda x: x["pipeline"]["priority"])
-
-    model = app.state.MODELS[model_id]
-
-    if "pipeline" in model:
-        sorted_filters.append(model)
-
-    for filter in sorted_filters:
-        r = None
-        try:
-            urlIdx = filter["urlIdx"]
-
-            url = openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx]
-            key = openai_app.state.config.OPENAI_API_KEYS[urlIdx]
-
-            if key != "":
-                headers = {"Authorization": f"Bearer {key}"}
-                r = requests.post(
-                    f"{url}/{filter['id']}/filter/inlet",
-                    headers=headers,
-                    json={
-                        "user": user,
-                        "body": payload,
-                    },
-                )
-
-                r.raise_for_status()
-                payload = r.json()
-        except Exception as e:
-            # Handle connection error here
-            print(f"Connection error: {e}")
-
-            if r is not None:
-                try:
-                    res = r.json()
-                except:
-                    pass
-                if "detail" in res:
-                    raise Exception(r.status_code, res["detail"])
-
-            else:
-                pass
-
-    if "pipeline" not in app.state.MODELS[model_id]:
-        if "chat_id" in payload:
-            del payload["chat_id"]
-
-        if "title" in payload:
-            del payload["title"]
-
-        if "task" in payload:
-            del payload["task"]
-
-    return payload
-
-
-class PipelineMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.method == "POST" and (
-            "/ollama/api/chat" in request.url.path
-            or "/chat/completions" in request.url.path
-        ):
-            log.debug(f"request.url.path: {request.url.path}")
-
-            # Read the original request body
-            body = await request.body()
-            # Decode body to string
-            body_str = body.decode("utf-8")
-            # Parse string to JSON
-            data = json.loads(body_str) if body_str else {}
-
-            user = get_current_user(
-                get_http_authorization_cred(request.headers.get("Authorization"))
-            )
-
-            try:
-                data = filter_pipeline(data, user)
-            except Exception as e:
-                return JSONResponse(
-                    status_code=e.args[0],
-                    content={"detail": e.args[1]},
-                )
-
-            modified_body_bytes = json.dumps(data).encode("utf-8")
-            # Replace the request body with the modified one
-            request._body = modified_body_bytes
-            # Set custom header to ensure content-length matches new body length
-            request.headers.__dict__["_list"] = [
-                (b"content-length", str(len(modified_body_bytes)).encode("utf-8")),
-                *[
-                    (k, v)
-                    for k, v in request.headers.raw
-                    if k.lower() != b"content-length"
-                ],
-            ]
-
-        response = await call_next(request)
-        return response
-
-    async def _receive(self, body: bytes):
-        return {"type": "http.request", "body": body, "more_body": False}
-
-
-app.add_middleware(PipelineMiddleware)
-
-
+app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.state.config = AppConfig()
+
+app.state.config.ENABLE_MODEL_FILTER = ENABLE_MODEL_FILTER
+app.state.config.MODEL_FILTER_LIST = MODEL_FILTER_LIST
+
+app.state.config.ENABLE_OLLAMA_API = ENABLE_OLLAMA_API
+app.state.config.OLLAMA_BASE_URLS = OLLAMA_BASE_URLS
+app.state.MODELS = {}
+
+
+# TODO: Implement a more intelligent load balancing mechanism for distributing requests among multiple backend instances.
+# Current implementation uses a simple round-robin approach (random.choice). Consider incorporating algorithms like weighted round-robin,
+# least connections, or least response time for better resource utilization and performance optimization.
 
 
 @app.middleware("http")
@@ -566,979 +88,1245 @@ async def check_url(request: Request, call_next):
     else:
         pass
 
-    start_time = int(time.time())
     response = await call_next(request)
-    process_time = int(time.time()) - start_time
-    response.headers["X-Process-Time"] = str(process_time)
-
     return response
 
 
-@app.middleware("http")
-async def update_embedding_function(request: Request, call_next):
-    response = await call_next(request)
-    if "/embedding/update" in request.url.path:
-        webui_app.state.EMBEDDING_FUNCTION = rag_app.state.EMBEDDING_FUNCTION
-    return response
+@app.head("/")
+@app.get("/")
+async def get_status():
+    return {"status": True}
 
 
-app.mount("/ws", socket_app)
+@app.get("/config")
+async def get_config(user=Depends(get_admin_user)):
+    return {"ENABLE_OLLAMA_API": app.state.config.ENABLE_OLLAMA_API}
 
 
-app.mount("/ollama", ollama_app)
-app.mount("/openai", openai_app)
+class OllamaConfigForm(BaseModel):
+    enable_ollama_api: Optional[bool] = None
 
-app.mount("/images/api/v1", images_app)
-app.mount("/audio/api/v1", audio_app)
-app.mount("/rag/api/v1", rag_app)
 
-app.mount("/api/v1", webui_app)
+@app.post("/config/update")
+async def update_config(form_data: OllamaConfigForm, user=Depends(get_admin_user)):
+    app.state.config.ENABLE_OLLAMA_API = form_data.enable_ollama_api
+    return {"ENABLE_OLLAMA_API": app.state.config.ENABLE_OLLAMA_API}
 
-webui_app.state.EMBEDDING_FUNCTION = rag_app.state.EMBEDDING_FUNCTION
+
+@app.get("/urls")
+async def get_ollama_api_urls(user=Depends(get_admin_user)):
+    return {"OLLAMA_BASE_URLS": app.state.config.OLLAMA_BASE_URLS}
+
+
+class UrlUpdateForm(BaseModel):
+    urls: List[str]
+
+
+@app.post("/urls/update")
+async def update_ollama_api_url(form_data: UrlUpdateForm, user=Depends(get_admin_user)):
+    app.state.config.OLLAMA_BASE_URLS = form_data.urls
+
+    log.info(f"app.state.config.OLLAMA_BASE_URLS: {app.state.config.OLLAMA_BASE_URLS}")
+    return {"OLLAMA_BASE_URLS": app.state.config.OLLAMA_BASE_URLS}
+
+
+async def fetch_url(url):
+    timeout = aiohttp.ClientTimeout(total=5)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.get(url) as response:
+                return await response.json()
+    except Exception as e:
+        # Handle connection error here
+        log.error(f"Connection error: {e}")
+        return None
+
+
+async def cleanup_response(
+    response: Optional[aiohttp.ClientResponse],
+    session: Optional[aiohttp.ClientSession],
+):
+    if response:
+        response.close()
+    if session:
+        await session.close()
+
+
+async def post_streaming_url(url: str, payload: str):
+    r = None
+    try:
+        session = aiohttp.ClientSession(
+            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+        )
+        r = await session.post(url, data=payload)
+        r.raise_for_status()
+
+        return StreamingResponse(
+            r.content,
+            status_code=r.status,
+            headers=dict(r.headers),
+            background=BackgroundTask(cleanup_response, response=r, session=session),
+        )
+    except Exception as e:
+        error_detail = "Corp WebIntel: Server Connection Error"
+        if r is not None:
+            try:
+                res = await r.json()
+                if "error" in res:
+                    error_detail = f"Ollama: {res['error']}"
+            except:
+                error_detail = f"Ollama: {e}"
+
+        raise HTTPException(
+            status_code=r.status if r else 500,
+            detail=error_detail,
+        )
+
+
+def merge_models_lists(model_lists):
+    merged_models = {}
+
+    for idx, model_list in enumerate(model_lists):
+        if model_list is not None:
+            for model in model_list:
+                digest = model["digest"]
+                if digest not in merged_models:
+                    model["urls"] = [idx]
+                    merged_models[digest] = model
+                else:
+                    merged_models[digest]["urls"].append(idx)
+
+    return list(merged_models.values())
+
+
+# user=Depends(get_current_user)
 
 
 async def get_all_models():
-    openai_models = []
-    ollama_models = []
-
-    if app.state.config.ENABLE_OPENAI_API:
-        openai_models = await get_openai_models()
-
-        openai_models = openai_models["data"]
+    log.info("get_all_models()")
 
     if app.state.config.ENABLE_OLLAMA_API:
-        ollama_models = await get_ollama_models()
-
-        ollama_models = [
-            {
-                "id": model["model"],
-                "name": model["name"],
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "ollama",
-                "ollama": model,
-            }
-            for model in ollama_models["models"]
+        tasks = [
+            fetch_url(f"{url}/api/tags") for url in app.state.config.OLLAMA_BASE_URLS
         ]
+        responses = await asyncio.gather(*tasks)
 
-    models = openai_models + ollama_models
-    custom_models = Models.get_all_models()
-
-    for custom_model in custom_models:
-        if custom_model.base_model_id == None:
-            for model in models:
-                if (
-                    custom_model.id == model["id"]
-                    or custom_model.id == model["id"].split(":")[0]
-                ):
-                    model["name"] = custom_model.name
-                    model["info"] = custom_model.model_dump()
-        else:
-            owned_by = "openai"
-            for model in models:
-                if (
-                    custom_model.base_model_id == model["id"]
-                    or custom_model.base_model_id == model["id"].split(":")[0]
-                ):
-                    owned_by = model["owned_by"]
-                    break
-
-            models.append(
-                {
-                    "id": custom_model.id,
-                    "name": custom_model.name,
-                    "object": "model",
-                    "created": custom_model.created_at,
-                    "owned_by": owned_by,
-                    "info": custom_model.model_dump(),
-                    "preset": True,
-                }
+        models = {
+            "models": merge_models_lists(
+                map(
+                    lambda response: response["models"] if response else None, responses
+                )
             )
+        }
 
-    app.state.MODELS = {model["id"]: model for model in models}
+    else:
+        models = {"models": []}
 
-    webui_app.state.MODELS = app.state.MODELS
+    app.state.MODELS = {model["model"]: model for model in models["models"]}
 
     return models
 
 
-@app.get("/api/models")
-async def get_models(user=Depends(get_verified_user)):
-    models = await get_all_models()
+@app.get("/api/tags")
+@app.get("/api/tags/{url_idx}")
+async def get_ollama_tags(
+    url_idx: Optional[int] = None, user=Depends(get_verified_user)
+):
+    if url_idx == None:
+        models = await get_all_models()
 
-    # Filter out filter pipelines
-    models = [
-        model
-        for model in models
-        if "pipeline" not in model or model["pipeline"].get("type", None) != "filter"
-    ]
-
-    if app.state.config.ENABLE_MODEL_FILTER:
-        if user.role == "user":
-            models = list(
-                filter(
-                    lambda model: model["id"] in app.state.config.MODEL_FILTER_LIST,
-                    models,
+        if app.state.config.ENABLE_MODEL_FILTER:
+            if user.role == "user":
+                models["models"] = list(
+                    filter(
+                        lambda model: model["name"]
+                        in app.state.config.MODEL_FILTER_LIST,
+                        models["models"],
+                    )
                 )
-            )
-            return {"data": models}
-
-    return {"data": models}
-
-
-@app.get("/api/task/config")
-async def get_task_config(user=Depends(get_verified_user)):
-    return {
-        "TASK_MODEL": app.state.config.TASK_MODEL,
-        "TASK_MODEL_EXTERNAL": app.state.config.TASK_MODEL_EXTERNAL,
-        "TITLE_GENERATION_PROMPT_TEMPLATE": app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE,
-        "SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE": app.state.config.SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE,
-        "SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD": app.state.config.SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD,
-        "TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE": app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
-    }
-
-
-class TaskConfigForm(BaseModel):
-    TASK_MODEL: Optional[str]
-    TASK_MODEL_EXTERNAL: Optional[str]
-    TITLE_GENERATION_PROMPT_TEMPLATE: str
-    SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE: str
-    SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD: int
-    TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE: str
-
-
-@app.post("/api/task/config/update")
-async def update_task_config(form_data: TaskConfigForm, user=Depends(get_admin_user)):
-    app.state.config.TASK_MODEL = form_data.TASK_MODEL
-    app.state.config.TASK_MODEL_EXTERNAL = form_data.TASK_MODEL_EXTERNAL
-    app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE = (
-        form_data.TITLE_GENERATION_PROMPT_TEMPLATE
-    )
-    app.state.config.SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE = (
-        form_data.SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE
-    )
-    app.state.config.SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD = (
-        form_data.SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD
-    )
-    app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE = (
-        form_data.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
-    )
-
-    return {
-        "TASK_MODEL": app.state.config.TASK_MODEL,
-        "TASK_MODEL_EXTERNAL": app.state.config.TASK_MODEL_EXTERNAL,
-        "TITLE_GENERATION_PROMPT_TEMPLATE": app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE,
-        "SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE": app.state.config.SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE,
-        "SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD": app.state.config.SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD,
-        "TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE": app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
-    }
-
-
-@app.post("/api/task/title/completions")
-async def generate_title(form_data: dict, user=Depends(get_verified_user)):
-    print("generate_title")
-
-    model_id = form_data["model"]
-    if model_id not in app.state.MODELS:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Model not found",
-        )
-
-    # Check if the user has a custom task model
-    # If the user has a custom task model, use that model
-    if app.state.MODELS[model_id]["owned_by"] == "ollama":
-        if app.state.config.TASK_MODEL:
-            task_model_id = app.state.config.TASK_MODEL
-            if task_model_id in app.state.MODELS:
-                model_id = task_model_id
+                return models
+        return models
     else:
-        if app.state.config.TASK_MODEL_EXTERNAL:
-            task_model_id = app.state.config.TASK_MODEL_EXTERNAL
-            if task_model_id in app.state.MODELS:
-                model_id = task_model_id
+        url = app.state.config.OLLAMA_BASE_URLS[url_idx]
 
-    print(model_id)
-    model = app.state.MODELS[model_id]
-
-    template = app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE
-
-    content = title_generation_template(
-        template,
-        form_data["prompt"],
-        {
-            "name": user.name,
-            "location": user.info.get("location") if user.info else None,
-        },
-    )
-
-    payload = {
-        "model": model_id,
-        "messages": [{"role": "user", "content": content}],
-        "stream": False,
-        "max_tokens": 50,
-        "chat_id": form_data.get("chat_id", None),
-        "title": True,
-    }
-
-    log.debug(payload)
-
-    try:
-        payload = filter_pipeline(payload, user)
-    except Exception as e:
-        return JSONResponse(
-            status_code=e.args[0],
-            content={"detail": e.args[1]},
-        )
-
-    if model["owned_by"] == "ollama":
-        return await generate_ollama_chat_completion(
-            OpenAIChatCompletionForm(**payload), user=user
-        )
-    else:
-        return await generate_openai_chat_completion(payload, user=user)
-
-
-@app.post("/api/task/query/completions")
-async def generate_search_query(form_data: dict, user=Depends(get_verified_user)):
-    print("generate_search_query")
-
-    if len(form_data["prompt"]) < app.state.config.SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Skip search query generation for short prompts (< {app.state.config.SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD} characters)",
-        )
-
-    model_id = form_data["model"]
-    if model_id not in app.state.MODELS:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Model not found",
-        )
-
-    # Check if the user has a custom task model
-    # If the user has a custom task model, use that model
-    if app.state.MODELS[model_id]["owned_by"] == "ollama":
-        if app.state.config.TASK_MODEL:
-            task_model_id = app.state.config.TASK_MODEL
-            if task_model_id in app.state.MODELS:
-                model_id = task_model_id
-    else:
-        if app.state.config.TASK_MODEL_EXTERNAL:
-            task_model_id = app.state.config.TASK_MODEL_EXTERNAL
-            if task_model_id in app.state.MODELS:
-                model_id = task_model_id
-
-    print(model_id)
-    model = app.state.MODELS[model_id]
-
-    template = app.state.config.SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE
-
-    content = search_query_generation_template(
-        template, form_data["prompt"], {"name": user.name}
-    )
-
-    payload = {
-        "model": model_id,
-        "messages": [{"role": "user", "content": content}],
-        "stream": False,
-        "max_tokens": 30,
-        "task": True,
-    }
-
-    print(payload)
-
-    try:
-        payload = filter_pipeline(payload, user)
-    except Exception as e:
-        return JSONResponse(
-            status_code=e.args[0],
-            content={"detail": e.args[1]},
-        )
-
-    if model["owned_by"] == "ollama":
-        return await generate_ollama_chat_completion(
-            OpenAIChatCompletionForm(**payload), user=user
-        )
-    else:
-        return await generate_openai_chat_completion(payload, user=user)
-
-
-@app.post("/api/task/emoji/completions")
-async def generate_emoji(form_data: dict, user=Depends(get_verified_user)):
-    print("generate_emoji")
-
-    model_id = form_data["model"]
-    if model_id not in app.state.MODELS:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Model not found",
-        )
-
-    # Check if the user has a custom task model
-    # If the user has a custom task model, use that model
-    if app.state.MODELS[model_id]["owned_by"] == "ollama":
-        if app.state.config.TASK_MODEL:
-            task_model_id = app.state.config.TASK_MODEL
-            if task_model_id in app.state.MODELS:
-                model_id = task_model_id
-    else:
-        if app.state.config.TASK_MODEL_EXTERNAL:
-            task_model_id = app.state.config.TASK_MODEL_EXTERNAL
-            if task_model_id in app.state.MODELS:
-                model_id = task_model_id
-
-    print(model_id)
-    model = app.state.MODELS[model_id]
-
-    template = '''
-Your task is to reflect the speaker's likely facial expression through a fitting emoji. Interpret emotions from the message and reflect their facial expression using fitting, diverse emojis (e.g., 😊, 😢, 😡, 😱).
-
-Message: """{{prompt}}"""
-'''
-
-    content = title_generation_template(
-        template,
-        form_data["prompt"],
-        {
-            "name": user.name,
-            "location": user.info.get("location") if user.info else None,
-        },
-    )
-
-    payload = {
-        "model": model_id,
-        "messages": [{"role": "user", "content": content}],
-        "stream": False,
-        "max_tokens": 4,
-        "chat_id": form_data.get("chat_id", None),
-        "task": True,
-    }
-
-    log.debug(payload)
-
-    try:
-        payload = filter_pipeline(payload, user)
-    except Exception as e:
-        return JSONResponse(
-            status_code=e.args[0],
-            content={"detail": e.args[1]},
-        )
-
-    if model["owned_by"] == "ollama":
-        return await generate_ollama_chat_completion(
-            OpenAIChatCompletionForm(**payload), user=user
-        )
-    else:
-        return await generate_openai_chat_completion(payload, user=user)
-
-
-@app.post("/api/task/tools/completions")
-async def get_tools_function_calling(form_data: dict, user=Depends(get_verified_user)):
-    print("get_tools_function_calling")
-
-    model_id = form_data["model"]
-    if model_id not in app.state.MODELS:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Model not found",
-        )
-
-    # Check if the user has a custom task model
-    # If the user has a custom task model, use that model
-    if app.state.MODELS[model_id]["owned_by"] == "ollama":
-        if app.state.config.TASK_MODEL:
-            task_model_id = app.state.config.TASK_MODEL
-            if task_model_id in app.state.MODELS:
-                model_id = task_model_id
-    else:
-        if app.state.config.TASK_MODEL_EXTERNAL:
-            task_model_id = app.state.config.TASK_MODEL_EXTERNAL
-            if task_model_id in app.state.MODELS:
-                model_id = task_model_id
-
-    print(model_id)
-    template = app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
-
-    try:
-        context = await get_function_call_response(
-            form_data["messages"], form_data["tool_id"], template, model_id, user
-        )
-        return context
-    except Exception as e:
-        return JSONResponse(
-            status_code=e.args[0],
-            content={"detail": e.args[1]},
-        )
-
-
-@app.post("/api/chat/completions")
-async def generate_chat_completions(form_data: dict, user=Depends(get_verified_user)):
-    model_id = form_data["model"]
-    if model_id not in app.state.MODELS:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Model not found",
-        )
-
-    model = app.state.MODELS[model_id]
-    print(model)
-
-    if model["owned_by"] == "ollama":
-        return await generate_ollama_chat_completion(
-            OpenAIChatCompletionForm(**form_data), user=user
-        )
-    else:
-        return await generate_openai_chat_completion(form_data, user=user)
-
-
-@app.post("/api/chat/completed")
-async def chat_completed(form_data: dict, user=Depends(get_verified_user)):
-    data = form_data
-    model_id = data["model"]
-
-    filters = [
-        model
-        for model in app.state.MODELS.values()
-        if "pipeline" in model
-        and "type" in model["pipeline"]
-        and model["pipeline"]["type"] == "filter"
-        and (
-            model["pipeline"]["pipelines"] == ["*"]
-            or any(
-                model_id == target_model_id
-                for target_model_id in model["pipeline"]["pipelines"]
-            )
-        )
-    ]
-    sorted_filters = sorted(filters, key=lambda x: x["pipeline"]["priority"])
-
-    print(model_id)
-
-    if model_id in app.state.MODELS:
-        model = app.state.MODELS[model_id]
-        if "pipeline" in model:
-            sorted_filters = [model] + sorted_filters
-
-    for filter in sorted_filters:
         r = None
         try:
-            urlIdx = filter["urlIdx"]
+            r = requests.request(method="GET", url=f"{url}/api/tags")
+            r.raise_for_status()
 
-            url = openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx]
-            key = openai_app.state.config.OPENAI_API_KEYS[urlIdx]
-
-            if key != "":
-                headers = {"Authorization": f"Bearer {key}"}
-                r = requests.post(
-                    f"{url}/{filter['id']}/filter/outlet",
-                    headers=headers,
-                    json={
-                        "user": {"id": user.id, "name": user.name, "role": user.role},
-                        "body": data,
-                    },
-                )
-
-                r.raise_for_status()
-                data = r.json()
+            return r.json()
         except Exception as e:
-            # Handle connection error here
-            print(f"Connection error: {e}")
-
+            log.exception(e)
+            error_detail = "Corp WebIntel: Server Connection Error"
             if r is not None:
                 try:
                     res = r.json()
-                    if "detail" in res:
-                        return JSONResponse(
-                            status_code=r.status_code,
-                            content=res,
-                        )
+                    if "error" in res:
+                        error_detail = f"Ollama: {res['error']}"
                 except:
-                    pass
+                    error_detail = f"Ollama: {e}"
 
+            raise HTTPException(
+                status_code=r.status_code if r else 500,
+                detail=error_detail,
+            )
+
+
+@app.get("/api/version")
+@app.get("/api/version/{url_idx}")
+async def get_ollama_versions(url_idx: Optional[int] = None):
+    if app.state.config.ENABLE_OLLAMA_API:
+        if url_idx == None:
+
+            # returns lowest version
+            tasks = [
+                fetch_url(f"{url}/api/version")
+                for url in app.state.config.OLLAMA_BASE_URLS
+            ]
+            responses = await asyncio.gather(*tasks)
+            responses = list(filter(lambda x: x is not None, responses))
+
+            if len(responses) > 0:
+                lowest_version = min(
+                    responses,
+                    key=lambda x: tuple(
+                        map(int, re.sub(r"^v|-.*", "", x["version"]).split("."))
+                    ),
+                )
+
+                return {"version": lowest_version["version"]}
             else:
-                pass
+                raise HTTPException(
+                    status_code=500,
+                    detail=ERROR_MESSAGES.OLLAMA_NOT_FOUND,
+                )
+        else:
+            url = app.state.config.OLLAMA_BASE_URLS[url_idx]
 
-    return data
+            r = None
+            try:
+                r = requests.request(method="GET", url=f"{url}/api/version")
+                r.raise_for_status()
+
+                return r.json()
+            except Exception as e:
+                log.exception(e)
+                error_detail = "Corp WebIntel: Server Connection Error"
+                if r is not None:
+                    try:
+                        res = r.json()
+                        if "error" in res:
+                            error_detail = f"Ollama: {res['error']}"
+                    except:
+                        error_detail = f"Ollama: {e}"
+
+                raise HTTPException(
+                    status_code=r.status_code if r else 500,
+                    detail=error_detail,
+                )
+    else:
+        return {"version": False}
 
 
-@app.get("/api/pipelines/list")
-async def get_pipelines_list(user=Depends(get_admin_user)):
-    responses = await get_openai_models(raw=True)
-
-    print(responses)
-    urlIdxs = [
-        idx
-        for idx, response in enumerate(responses)
-        if response != None and "pipelines" in response
-    ]
-
-    return {
-        "data": [
-            {
-                "url": openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx],
-                "idx": urlIdx,
-            }
-            for urlIdx in urlIdxs
-        ]
-    }
+class ModelNameForm(BaseModel):
+    name: str
 
 
-@app.post("/api/pipelines/upload")
-async def upload_pipeline(
-    urlIdx: int = Form(...), file: UploadFile = File(...), user=Depends(get_admin_user)
+@app.post("/api/pull")
+@app.post("/api/pull/{url_idx}")
+async def pull_model(
+    form_data: ModelNameForm, url_idx: int = 0, user=Depends(get_admin_user)
 ):
-    print("upload_pipeline", urlIdx, file.filename)
-    # Check if the uploaded file is a python file
-    if not file.filename.endswith(".py"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only Python (.py) files are allowed.",
-        )
-
-    upload_folder = f"{CACHE_DIR}/pipelines"
-    os.makedirs(upload_folder, exist_ok=True)
-    file_path = os.path.join(upload_folder, file.filename)
-
-    try:
-        # Save the uploaded file
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        url = openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx]
-        key = openai_app.state.config.OPENAI_API_KEYS[urlIdx]
-
-        headers = {"Authorization": f"Bearer {key}"}
-
-        with open(file_path, "rb") as f:
-            files = {"file": f}
-            r = requests.post(f"{url}/pipelines/upload", headers=headers, files=files)
-
-        r.raise_for_status()
-        data = r.json()
-
-        return {**data}
-    except Exception as e:
-        # Handle connection error here
-        print(f"Connection error: {e}")
-
-        detail = "Pipeline not found"
-        if r is not None:
-            try:
-                res = r.json()
-                if "detail" in res:
-                    detail = res["detail"]
-            except:
-                pass
-
-        raise HTTPException(
-            status_code=(r.status_code if r is not None else status.HTTP_404_NOT_FOUND),
-            detail=detail,
-        )
-    finally:
-        # Ensure the file is deleted after the upload is completed or on failure
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
-
-class AddPipelineForm(BaseModel):
-    url: str
-    urlIdx: int
-
-
-@app.post("/api/pipelines/add")
-async def add_pipeline(form_data: AddPipelineForm, user=Depends(get_admin_user)):
+    url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+    log.info(f"url: {url}")
 
     r = None
-    try:
-        urlIdx = form_data.urlIdx
 
-        url = openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx]
-        key = openai_app.state.config.OPENAI_API_KEYS[urlIdx]
+    # Admin should be able to pull models from any source
+    payload = {**form_data.model_dump(exclude_none=True), "insecure": True}
 
-        headers = {"Authorization": f"Bearer {key}"}
-        r = requests.post(
-            f"{url}/pipelines/add", headers=headers, json={"url": form_data.url}
-        )
-
-        r.raise_for_status()
-        data = r.json()
-
-        return {**data}
-    except Exception as e:
-        # Handle connection error here
-        print(f"Connection error: {e}")
-
-        detail = "Pipeline not found"
-        if r is not None:
-            try:
-                res = r.json()
-                if "detail" in res:
-                    detail = res["detail"]
-            except:
-                pass
-
-        raise HTTPException(
-            status_code=(r.status_code if r is not None else status.HTTP_404_NOT_FOUND),
-            detail=detail,
-        )
+    return await post_streaming_url(f"{url}/api/pull", json.dumps(payload))
 
 
-class DeletePipelineForm(BaseModel):
-    id: str
-    urlIdx: int
+class PushModelForm(BaseModel):
+    name: str
+    insecure: Optional[bool] = None
+    stream: Optional[bool] = None
 
 
-@app.delete("/api/pipelines/delete")
-async def delete_pipeline(form_data: DeletePipelineForm, user=Depends(get_admin_user)):
-
-    r = None
-    try:
-        urlIdx = form_data.urlIdx
-
-        url = openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx]
-        key = openai_app.state.config.OPENAI_API_KEYS[urlIdx]
-
-        headers = {"Authorization": f"Bearer {key}"}
-        r = requests.delete(
-            f"{url}/pipelines/delete", headers=headers, json={"id": form_data.id}
-        )
-
-        r.raise_for_status()
-        data = r.json()
-
-        return {**data}
-    except Exception as e:
-        # Handle connection error here
-        print(f"Connection error: {e}")
-
-        detail = "Pipeline not found"
-        if r is not None:
-            try:
-                res = r.json()
-                if "detail" in res:
-                    detail = res["detail"]
-            except:
-                pass
-
-        raise HTTPException(
-            status_code=(r.status_code if r is not None else status.HTTP_404_NOT_FOUND),
-            detail=detail,
-        )
-
-
-@app.get("/api/pipelines")
-async def get_pipelines(urlIdx: Optional[int] = None, user=Depends(get_admin_user)):
-    r = None
-    try:
-        urlIdx
-
-        url = openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx]
-        key = openai_app.state.config.OPENAI_API_KEYS[urlIdx]
-
-        headers = {"Authorization": f"Bearer {key}"}
-        r = requests.get(f"{url}/pipelines", headers=headers)
-
-        r.raise_for_status()
-        data = r.json()
-
-        return {**data}
-    except Exception as e:
-        # Handle connection error here
-        print(f"Connection error: {e}")
-
-        detail = "Pipeline not found"
-        if r is not None:
-            try:
-                res = r.json()
-                if "detail" in res:
-                    detail = res["detail"]
-            except:
-                pass
-
-        raise HTTPException(
-            status_code=(r.status_code if r is not None else status.HTTP_404_NOT_FOUND),
-            detail=detail,
-        )
-
-
-@app.get("/api/pipelines/{pipeline_id}/valves")
-async def get_pipeline_valves(
-    urlIdx: Optional[int], pipeline_id: str, user=Depends(get_admin_user)
-):
-    models = await get_all_models()
-    r = None
-    try:
-
-        url = openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx]
-        key = openai_app.state.config.OPENAI_API_KEYS[urlIdx]
-
-        headers = {"Authorization": f"Bearer {key}"}
-        r = requests.get(f"{url}/{pipeline_id}/valves", headers=headers)
-
-        r.raise_for_status()
-        data = r.json()
-
-        return {**data}
-    except Exception as e:
-        # Handle connection error here
-        print(f"Connection error: {e}")
-
-        detail = "Pipeline not found"
-
-        if r is not None:
-            try:
-                res = r.json()
-                if "detail" in res:
-                    detail = res["detail"]
-            except:
-                pass
-
-        raise HTTPException(
-            status_code=(r.status_code if r is not None else status.HTTP_404_NOT_FOUND),
-            detail=detail,
-        )
-
-
-@app.get("/api/pipelines/{pipeline_id}/valves/spec")
-async def get_pipeline_valves_spec(
-    urlIdx: Optional[int], pipeline_id: str, user=Depends(get_admin_user)
-):
-    models = await get_all_models()
-
-    r = None
-    try:
-        url = openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx]
-        key = openai_app.state.config.OPENAI_API_KEYS[urlIdx]
-
-        headers = {"Authorization": f"Bearer {key}"}
-        r = requests.get(f"{url}/{pipeline_id}/valves/spec", headers=headers)
-
-        r.raise_for_status()
-        data = r.json()
-
-        return {**data}
-    except Exception as e:
-        # Handle connection error here
-        print(f"Connection error: {e}")
-
-        detail = "Pipeline not found"
-        if r is not None:
-            try:
-                res = r.json()
-                if "detail" in res:
-                    detail = res["detail"]
-            except:
-                pass
-
-        raise HTTPException(
-            status_code=(r.status_code if r is not None else status.HTTP_404_NOT_FOUND),
-            detail=detail,
-        )
-
-
-@app.post("/api/pipelines/{pipeline_id}/valves/update")
-async def update_pipeline_valves(
-    urlIdx: Optional[int],
-    pipeline_id: str,
-    form_data: dict,
+@app.delete("/api/push")
+@app.delete("/api/push/{url_idx}")
+async def push_model(
+    form_data: PushModelForm,
+    url_idx: Optional[int] = None,
     user=Depends(get_admin_user),
 ):
-    models = await get_all_models()
+    if url_idx == None:
+        if form_data.name in app.state.MODELS:
+            url_idx = app.state.MODELS[form_data.name]["urls"][0]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.MODEL_NOT_FOUND(form_data.name),
+            )
 
-    r = None
+    url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+    log.debug(f"url: {url}")
+
+    return await post_streaming_url(
+        f"{url}/api/push", form_data.model_dump_json(exclude_none=True).encode()
+    )
+
+
+class CreateModelForm(BaseModel):
+    name: str
+    modelfile: Optional[str] = None
+    stream: Optional[bool] = None
+    path: Optional[str] = None
+
+
+@app.post("/api/create")
+@app.post("/api/create/{url_idx}")
+async def create_model(
+    form_data: CreateModelForm, url_idx: int = 0, user=Depends(get_admin_user)
+):
+    log.debug(f"form_data: {form_data}")
+    url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+    log.info(f"url: {url}")
+
+    return await post_streaming_url(
+        f"{url}/api/create", form_data.model_dump_json(exclude_none=True).encode()
+    )
+
+
+class CopyModelForm(BaseModel):
+    source: str
+    destination: str
+
+
+@app.post("/api/copy")
+@app.post("/api/copy/{url_idx}")
+async def copy_model(
+    form_data: CopyModelForm,
+    url_idx: Optional[int] = None,
+    user=Depends(get_admin_user),
+):
+    if url_idx == None:
+        if form_data.source in app.state.MODELS:
+            url_idx = app.state.MODELS[form_data.source]["urls"][0]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.MODEL_NOT_FOUND(form_data.source),
+            )
+
+    url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+    log.info(f"url: {url}")
+
     try:
-        url = openai_app.state.config.OPENAI_API_BASE_URLS[urlIdx]
-        key = openai_app.state.config.OPENAI_API_KEYS[urlIdx]
-
-        headers = {"Authorization": f"Bearer {key}"}
-        r = requests.post(
-            f"{url}/{pipeline_id}/valves/update",
-            headers=headers,
-            json={**form_data},
+        r = requests.request(
+            method="POST",
+            url=f"{url}/api/copy",
+            data=form_data.model_dump_json(exclude_none=True).encode(),
         )
-
         r.raise_for_status()
-        data = r.json()
 
-        return {**data}
+        log.debug(f"r.text: {r.text}")
+
+        return True
     except Exception as e:
-        # Handle connection error here
-        print(f"Connection error: {e}")
-
-        detail = "Pipeline not found"
-
+        log.exception(e)
+        error_detail = "Corp WebIntel: Server Connection Error"
         if r is not None:
             try:
                 res = r.json()
-                if "detail" in res:
-                    detail = res["detail"]
+                if "error" in res:
+                    error_detail = f"Ollama: {res['error']}"
             except:
-                pass
+                error_detail = f"Ollama: {e}"
 
         raise HTTPException(
-            status_code=(r.status_code if r is not None else status.HTTP_404_NOT_FOUND),
-            detail=detail,
+            status_code=r.status_code if r else 500,
+            detail=error_detail,
         )
 
 
-@app.get("/api/config")
-async def get_app_config():
-    # Checking and Handling the Absence of 'ui' in CONFIG_DATA
-
-    default_locale = "en-US"
-    if "ui" in CONFIG_DATA:
-        default_locale = CONFIG_DATA["ui"].get("default_locale", "en-US")
-
-    # The Rest of the Function Now Uses the Variables Defined Above
-    return {
-        "status": True,
-        "name": WEBUI_NAME,
-        "version": VERSION,
-        "default_locale": default_locale,
-        "default_models": webui_app.state.config.DEFAULT_MODELS,
-        "default_prompt_suggestions": webui_app.state.config.DEFAULT_PROMPT_SUGGESTIONS,
-        "features": {
-            "auth": WEBUI_AUTH,
-            "auth_trusted_header": bool(webui_app.state.AUTH_TRUSTED_EMAIL_HEADER),
-            "enable_signup": webui_app.state.config.ENABLE_SIGNUP,
-            "enable_web_search": rag_app.state.config.ENABLE_RAG_WEB_SEARCH,
-            "enable_image_generation": images_app.state.config.ENABLED,
-            "enable_community_sharing": webui_app.state.config.ENABLE_COMMUNITY_SHARING,
-            "enable_admin_export": ENABLE_ADMIN_EXPORT,
-        },
-        "audio": {
-            "tts": {
-                "engine": audio_app.state.config.TTS_ENGINE,
-                "voice": audio_app.state.config.TTS_VOICE,
-            },
-            "stt": {
-                "engine": audio_app.state.config.STT_ENGINE,
-            },
-        },
-    }
-
-
-@app.get("/api/config/model/filter")
-async def get_model_filter_config(user=Depends(get_admin_user)):
-    return {
-        "enabled": app.state.config.ENABLE_MODEL_FILTER,
-        "models": app.state.config.MODEL_FILTER_LIST,
-    }
-
-
-class ModelFilterConfigForm(BaseModel):
-    enabled: bool
-    models: List[str]
-
-
-@app.post("/api/config/model/filter")
-async def update_model_filter_config(
-    form_data: ModelFilterConfigForm, user=Depends(get_admin_user)
+@app.delete("/api/delete")
+@app.delete("/api/delete/{url_idx}")
+async def delete_model(
+    form_data: ModelNameForm,
+    url_idx: Optional[int] = None,
+    user=Depends(get_admin_user),
 ):
-    app.state.config.ENABLE_MODEL_FILTER = form_data.enabled
-    app.state.config.MODEL_FILTER_LIST = form_data.models
+    if url_idx == None:
+        if form_data.name in app.state.MODELS:
+            url_idx = app.state.MODELS[form_data.name]["urls"][0]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.MODEL_NOT_FOUND(form_data.name),
+            )
 
-    return {
-        "enabled": app.state.config.ENABLE_MODEL_FILTER,
-        "models": app.state.config.MODEL_FILTER_LIST,
+    url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+    log.info(f"url: {url}")
+
+    try:
+        r = requests.request(
+            method="DELETE",
+            url=f"{url}/api/delete",
+            data=form_data.model_dump_json(exclude_none=True).encode(),
+        )
+        r.raise_for_status()
+
+        log.debug(f"r.text: {r.text}")
+
+        return True
+    except Exception as e:
+        log.exception(e)
+        error_detail = "Corp WebIntel: Server Connection Error"
+        if r is not None:
+            try:
+                res = r.json()
+                if "error" in res:
+                    error_detail = f"Ollama: {res['error']}"
+            except:
+                error_detail = f"Ollama: {e}"
+
+        raise HTTPException(
+            status_code=r.status_code if r else 500,
+            detail=error_detail,
+        )
+
+
+@app.post("/api/show")
+async def show_model_info(form_data: ModelNameForm, user=Depends(get_verified_user)):
+    if form_data.name not in app.state.MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=ERROR_MESSAGES.MODEL_NOT_FOUND(form_data.name),
+        )
+
+    url_idx = random.choice(app.state.MODELS[form_data.name]["urls"])
+    url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+    log.info(f"url: {url}")
+
+    try:
+        r = requests.request(
+            method="POST",
+            url=f"{url}/api/show",
+            data=form_data.model_dump_json(exclude_none=True).encode(),
+        )
+        r.raise_for_status()
+
+        return r.json()
+    except Exception as e:
+        log.exception(e)
+        error_detail = "Corp WebIntel: Server Connection Error"
+        if r is not None:
+            try:
+                res = r.json()
+                if "error" in res:
+                    error_detail = f"Ollama: {res['error']}"
+            except:
+                error_detail = f"Ollama: {e}"
+
+        raise HTTPException(
+            status_code=r.status_code if r else 500,
+            detail=error_detail,
+        )
+
+
+class GenerateEmbeddingsForm(BaseModel):
+    model: str
+    prompt: str
+    options: Optional[dict] = None
+    keep_alive: Optional[Union[int, str]] = None
+
+
+@app.post("/api/embeddings")
+@app.post("/api/embeddings/{url_idx}")
+async def generate_embeddings(
+    form_data: GenerateEmbeddingsForm,
+    url_idx: Optional[int] = None,
+    user=Depends(get_verified_user),
+):
+    if url_idx == None:
+        model = form_data.model
+
+        if ":" not in model:
+            model = f"{model}:latest"
+
+        if model in app.state.MODELS:
+            url_idx = random.choice(app.state.MODELS[model]["urls"])
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.MODEL_NOT_FOUND(form_data.model),
+            )
+
+    url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+    log.info(f"url: {url}")
+
+    try:
+        r = requests.request(
+            method="POST",
+            url=f"{url}/api/embeddings",
+            data=form_data.model_dump_json(exclude_none=True).encode(),
+        )
+        r.raise_for_status()
+
+        return r.json()
+    except Exception as e:
+        log.exception(e)
+        error_detail = "Corp WebIntel: Server Connection Error"
+        if r is not None:
+            try:
+                res = r.json()
+                if "error" in res:
+                    error_detail = f"Ollama: {res['error']}"
+            except:
+                error_detail = f"Ollama: {e}"
+
+        raise HTTPException(
+            status_code=r.status_code if r else 500,
+            detail=error_detail,
+        )
+
+
+def generate_ollama_embeddings(
+    form_data: GenerateEmbeddingsForm,
+    url_idx: Optional[int] = None,
+):
+
+    log.info(f"generate_ollama_embeddings {form_data}")
+
+    if url_idx == None:
+        model = form_data.model
+
+        if ":" not in model:
+            model = f"{model}:latest"
+
+        if model in app.state.MODELS:
+            url_idx = random.choice(app.state.MODELS[model]["urls"])
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.MODEL_NOT_FOUND(form_data.model),
+            )
+
+    url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+    log.info(f"url: {url}")
+
+    try:
+        r = requests.request(
+            method="POST",
+            url=f"{url}/api/embeddings",
+            data=form_data.model_dump_json(exclude_none=True).encode(),
+        )
+        r.raise_for_status()
+
+        data = r.json()
+
+        log.info(f"generate_ollama_embeddings {data}")
+
+        if "embedding" in data:
+            return data["embedding"]
+        else:
+            raise "Something went wrong :/"
+    except Exception as e:
+        log.exception(e)
+        error_detail = "Corp WebIntel: Server Connection Error"
+        if r is not None:
+            try:
+                res = r.json()
+                if "error" in res:
+                    error_detail = f"Ollama: {res['error']}"
+            except:
+                error_detail = f"Ollama: {e}"
+
+        raise error_detail
+
+
+class GenerateCompletionForm(BaseModel):
+    model: str
+    prompt: str
+    images: Optional[List[str]] = None
+    format: Optional[str] = None
+    options: Optional[dict] = None
+    system: Optional[str] = None
+    template: Optional[str] = None
+    context: Optional[str] = None
+    stream: Optional[bool] = True
+    raw: Optional[bool] = None
+    keep_alive: Optional[Union[int, str]] = None
+
+
+@app.post("/api/generate")
+@app.post("/api/generate/{url_idx}")
+async def generate_completion(
+    form_data: GenerateCompletionForm,
+    url_idx: Optional[int] = None,
+    user=Depends(get_verified_user),
+):
+
+    if url_idx == None:
+        model = form_data.model
+
+        if ":" not in model:
+            model = f"{model}:latest"
+
+        if model in app.state.MODELS:
+            url_idx = random.choice(app.state.MODELS[model]["urls"])
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.MODEL_NOT_FOUND(form_data.model),
+            )
+
+    url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+    log.info(f"url: {url}")
+
+    return await post_streaming_url(
+        f"{url}/api/generate", form_data.model_dump_json(exclude_none=True).encode()
+    )
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+    images: Optional[List[str]] = None
+
+
+class GenerateChatCompletionForm(BaseModel):
+    model: str
+    messages: List[ChatMessage]
+    format: Optional[str] = None
+    options: Optional[dict] = None
+    template: Optional[str] = None
+    stream: Optional[bool] = None
+    keep_alive: Optional[Union[int, str]] = None
+
+
+@app.post("/api/chat")
+@app.post("/api/chat/{url_idx}")
+async def generate_chat_completion(
+    form_data: GenerateChatCompletionForm,
+    url_idx: Optional[int] = None,
+    user=Depends(get_verified_user),
+):
+
+    log.debug(
+        "form_data.model_dump_json(exclude_none=True).encode(): {0} ".format(
+            form_data.model_dump_json(exclude_none=True).encode()
+        )
+    )
+
+    payload = {
+        **form_data.model_dump(exclude_none=True),
     }
 
+    model_id = form_data.model
+    model_info = Models.get_model_by_id(model_id)
 
-@app.get("/api/webhook")
-async def get_webhook_url(user=Depends(get_admin_user)):
-    return {
-        "url": app.state.config.WEBHOOK_URL,
+    if model_info:
+        if model_info.base_model_id:
+            payload["model"] = model_info.base_model_id
+
+        model_info.params = model_info.params.model_dump()
+
+        if model_info.params:
+            payload["options"] = {}
+
+            if model_info.params.get("mirostat", None):
+                payload["options"]["mirostat"] = model_info.params.get("mirostat", None)
+
+            if model_info.params.get("mirostat_eta", None):
+                payload["options"]["mirostat_eta"] = model_info.params.get(
+                    "mirostat_eta", None
+                )
+
+            if model_info.params.get("mirostat_tau", None):
+
+                payload["options"]["mirostat_tau"] = model_info.params.get(
+                    "mirostat_tau", None
+                )
+
+            if model_info.params.get("num_ctx", None):
+                payload["options"]["num_ctx"] = model_info.params.get("num_ctx", None)
+
+            if model_info.params.get("num_batch", None):
+                payload["options"]["num_batch"] = model_info.params.get(
+                    "num_batch", None
+                )
+
+            if model_info.params.get("num_keep", None):
+                payload["options"]["num_keep"] = model_info.params.get("num_keep", None)
+
+            if model_info.params.get("repeat_last_n", None):
+                payload["options"]["repeat_last_n"] = model_info.params.get(
+                    "repeat_last_n", None
+                )
+
+            if model_info.params.get("frequency_penalty", None):
+                payload["options"]["repeat_penalty"] = model_info.params.get(
+                    "frequency_penalty", None
+                )
+
+            if model_info.params.get("temperature", None) is not None:
+                payload["options"]["temperature"] = model_info.params.get(
+                    "temperature", None
+                )
+
+            if model_info.params.get("seed", None):
+                payload["options"]["seed"] = model_info.params.get("seed", None)
+
+            if model_info.params.get("stop", None):
+                payload["options"]["stop"] = (
+                    [
+                        bytes(stop, "utf-8").decode("unicode_escape")
+                        for stop in model_info.params["stop"]
+                    ]
+                    if model_info.params.get("stop", None)
+                    else None
+                )
+
+            if model_info.params.get("tfs_z", None):
+                payload["options"]["tfs_z"] = model_info.params.get("tfs_z", None)
+
+            if model_info.params.get("max_tokens", None):
+                payload["options"]["num_predict"] = model_info.params.get(
+                    "max_tokens", None
+                )
+
+            if model_info.params.get("top_k", None):
+                payload["options"]["top_k"] = model_info.params.get("top_k", None)
+
+            if model_info.params.get("top_p", None):
+                payload["options"]["top_p"] = model_info.params.get("top_p", None)
+
+            if model_info.params.get("use_mmap", None):
+                payload["options"]["use_mmap"] = model_info.params.get("use_mmap", None)
+
+            if model_info.params.get("use_mlock", None):
+                payload["options"]["use_mlock"] = model_info.params.get(
+                    "use_mlock", None
+                )
+
+            if model_info.params.get("num_thread", None):
+                payload["options"]["num_thread"] = model_info.params.get(
+                    "num_thread", None
+                )
+
+        if model_info.params.get("system", None):
+            # Check if the payload already has a system message
+            # If not, add a system message to the payload
+            if payload.get("messages"):
+                for message in payload["messages"]:
+                    if message.get("role") == "system":
+                        message["content"] = (
+                            model_info.params.get("system", None) + message["content"]
+                        )
+                        break
+                else:
+                    payload["messages"].insert(
+                        0,
+                        {
+                            "role": "system",
+                            "content": model_info.params.get("system", None),
+                        },
+                    )
+
+    if url_idx == None:
+        if ":" not in payload["model"]:
+            payload["model"] = f"{payload['model']}:latest"
+
+        if payload["model"] in app.state.MODELS:
+            url_idx = random.choice(app.state.MODELS[payload["model"]]["urls"])
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.MODEL_NOT_FOUND(form_data.model),
+            )
+
+    url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+    log.info(f"url: {url}")
+    log.debug(payload)
+
+    return await post_streaming_url(f"{url}/api/chat", json.dumps(payload))
+
+
+# TODO: we should update this part once Ollama supports other types
+class OpenAIChatMessageContent(BaseModel):
+    type: str
+    model_config = ConfigDict(extra="allow")
+
+
+class OpenAIChatMessage(BaseModel):
+    role: str
+    content: Union[str, OpenAIChatMessageContent]
+
+    model_config = ConfigDict(extra="allow")
+
+
+class OpenAIChatCompletionForm(BaseModel):
+    model: str
+    messages: List[OpenAIChatMessage]
+
+    model_config = ConfigDict(extra="allow")
+
+
+@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions/{url_idx}")
+async def generate_openai_chat_completion(
+    form_data: OpenAIChatCompletionForm,
+    url_idx: Optional[int] = None,
+    user=Depends(get_verified_user),
+):
+
+    payload = {
+        **form_data.model_dump(exclude_none=True),
     }
+
+    model_id = form_data.model
+    model_info = Models.get_model_by_id(model_id)
+
+    if model_info:
+        if model_info.base_model_id:
+            payload["model"] = model_info.base_model_id
+
+        model_info.params = model_info.params.model_dump()
+
+        if model_info.params:
+            payload["temperature"] = model_info.params.get("temperature", None)
+            payload["top_p"] = model_info.params.get("top_p", None)
+            payload["max_tokens"] = model_info.params.get("max_tokens", None)
+            payload["frequency_penalty"] = model_info.params.get(
+                "frequency_penalty", None
+            )
+            payload["seed"] = model_info.params.get("seed", None)
+            payload["stop"] = (
+                [
+                    bytes(stop, "utf-8").decode("unicode_escape")
+                    for stop in model_info.params["stop"]
+                ]
+                if model_info.params.get("stop", None)
+                else None
+            )
+
+        if model_info.params.get("system", None):
+            # Check if the payload already has a system message
+            # If not, add a system message to the payload
+            if payload.get("messages"):
+                for message in payload["messages"]:
+                    if message.get("role") == "system":
+                        message["content"] = (
+                            model_info.params.get("system", None) + message["content"]
+                        )
+                        break
+                else:
+                    payload["messages"].insert(
+                        0,
+                        {
+                            "role": "system",
+                            "content": model_info.params.get("system", None),
+                        },
+                    )
+
+    if url_idx == None:
+        if ":" not in payload["model"]:
+            payload["model"] = f"{payload['model']}:latest"
+
+        if payload["model"] in app.state.MODELS:
+            url_idx = random.choice(app.state.MODELS[payload["model"]]["urls"])
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.MODEL_NOT_FOUND(form_data.model),
+            )
+
+    url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+    log.info(f"url: {url}")
+
+    return await post_streaming_url(f"{url}/v1/chat/completions", json.dumps(payload))
+
+
+@app.get("/v1/models")
+@app.get("/v1/models/{url_idx}")
+async def get_openai_models(
+    url_idx: Optional[int] = None,
+    user=Depends(get_verified_user),
+):
+    if url_idx == None:
+        models = await get_all_models()
+
+        if app.state.config.ENABLE_MODEL_FILTER:
+            if user.role == "user":
+                models["models"] = list(
+                    filter(
+                        lambda model: model["name"]
+                        in app.state.config.MODEL_FILTER_LIST,
+                        models["models"],
+                    )
+                )
+
+        return {
+            "data": [
+                {
+                    "id": model["model"],
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "openai",
+                }
+                for model in models["models"]
+            ],
+            "object": "list",
+        }
+
+    else:
+        url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+        try:
+            r = requests.request(method="GET", url=f"{url}/api/tags")
+            r.raise_for_status()
+
+            models = r.json()
+
+            return {
+                "data": [
+                    {
+                        "id": model["model"],
+                        "object": "model",
+                        "created": int(time.time()),
+                        "owned_by": "openai",
+                    }
+                    for model in models["models"]
+                ],
+                "object": "list",
+            }
+
+        except Exception as e:
+            log.exception(e)
+            error_detail = "Corp WebIntel: Server Connection Error"
+            if r is not None:
+                try:
+                    res = r.json()
+                    if "error" in res:
+                        error_detail = f"Ollama: {res['error']}"
+                except:
+                    error_detail = f"Ollama: {e}"
+
+            raise HTTPException(
+                status_code=r.status_code if r else 500,
+                detail=error_detail,
+            )
 
 
 class UrlForm(BaseModel):
     url: str
 
 
-@app.post("/api/webhook")
-async def update_webhook_url(form_data: UrlForm, user=Depends(get_admin_user)):
-    app.state.config.WEBHOOK_URL = form_data.url
-    webui_app.state.WEBHOOK_URL = app.state.config.WEBHOOK_URL
-    return {"url": app.state.config.WEBHOOK_URL}
+class UploadBlobForm(BaseModel):
+    filename: str
 
 
-@app.get("/api/version")
-async def get_app_config():
-    return {
-        "version": VERSION,
-    }
-
-
-@app.get("/api/changelog")
-async def get_app_changelog():
-    return {key: CHANGELOG[key] for idx, key in enumerate(CHANGELOG) if idx < 5}
-
-
-@app.get("/api/version/updates")
-async def get_app_latest_release_version():
+def parse_huggingface_url(hf_url):
     try:
-        async with aiohttp.ClientSession(trust_env=True) as session:
-            async with session.get(
-                "https://api.github.com/repos/open-webui/open-webui/releases/latest"
-            ) as response:
-                response.raise_for_status()
-                data = await response.json()
-                latest_version = data["tag_name"]
+        # Parse the URL
+        parsed_url = urlparse(hf_url)
 
-                return {"current": VERSION, "latest": latest_version[1:]}
-    except aiohttp.ClientError as e:
+        # Get the path and split it into components
+        path_components = parsed_url.path.split("/")
+
+        # Extract the desired output
+        user_repo = "/".join(path_components[1:3])
+        model_file = path_components[-1]
+
+        return model_file
+    except ValueError:
+        return None
+
+
+async def download_file_stream(
+    ollama_url, file_url, file_path, file_name, chunk_size=1024 * 1024
+):
+    done = False
+
+    if os.path.exists(file_path):
+        current_size = os.path.getsize(file_path)
+    else:
+        current_size = 0
+
+    headers = {"Range": f"bytes={current_size}-"} if current_size > 0 else {}
+
+    timeout = aiohttp.ClientTimeout(total=600)  # Set the timeout
+
+    async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+        async with session.get(file_url, headers=headers) as response:
+            total_size = int(response.headers.get("content-length", 0)) + current_size
+
+            with open(file_path, "ab+") as file:
+                async for data in response.content.iter_chunked(chunk_size):
+                    current_size += len(data)
+                    file.write(data)
+
+                    done = current_size == total_size
+                    progress = round((current_size / total_size) * 100, 2)
+
+                    yield f'data: {{"progress": {progress}, "completed": {current_size}, "total": {total_size}}}\n\n'
+
+                if done:
+                    file.seek(0)
+                    hashed = calculate_sha256(file)
+                    file.seek(0)
+
+                    url = f"{ollama_url}/api/blobs/sha256:{hashed}"
+                    response = requests.post(url, data=file)
+
+                    if response.ok:
+                        res = {
+                            "done": done,
+                            "blob": f"sha256:{hashed}",
+                            "name": file_name,
+                        }
+                        os.remove(file_path)
+
+                        yield f"data: {json.dumps(res)}\n\n"
+                    else:
+                        raise "Ollama: Could not create blob, Please try again."
+
+
+# def number_generator():
+#     for i in range(1, 101):
+#         yield f"data: {i}\n"
+
+
+# url = "https://huggingface.co/TheBloke/stablelm-zephyr-3b-GGUF/resolve/main/stablelm-zephyr-3b.Q2_K.gguf"
+@app.post("/models/download")
+@app.post("/models/download/{url_idx}")
+async def download_model(
+    form_data: UrlForm,
+    url_idx: Optional[int] = None,
+):
+
+    allowed_hosts = ["https://huggingface.co/", "https://github.com/"]
+
+    if not any(form_data.url.startswith(host) for host in allowed_hosts):
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=ERROR_MESSAGES.RATE_LIMIT_EXCEEDED,
+            status_code=400,
+            detail="Invalid file_url. Only URLs from allowed hosts are permitted.",
         )
 
+    if url_idx == None:
+        url_idx = 0
+    url = app.state.config.OLLAMA_BASE_URLS[url_idx]
 
-@app.get("/manifest.json")
-async def get_manifest_json():
-    return {
-        "name": WEBUI_NAME,
-        "short_name": WEBUI_NAME,
-        "start_url": "/",
-        "display": "standalone",
-        "background_color": "#343541",
-        "theme_color": "#343541",
-        "orientation": "portrait-primary",
-        "icons": [{"src": "/static/logo.png", "type": "image/png", "sizes": "500x500"}],
-    }
+    file_name = parse_huggingface_url(form_data.url)
 
+    if file_name:
+        file_path = f"{UPLOAD_DIR}/{file_name}"
 
-@app.get("/opensearch.xml")
-async def get_opensearch_xml():
-    xml_content = rf"""
-    <OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/" xmlns:moz="http://www.mozilla.org/2006/browser/search/">
-    <ShortName>{WEBUI_NAME}</ShortName>
-    <Description>Search {WEBUI_NAME}</Description>
-    <InputEncoding>UTF-8</InputEncoding>
-    <Image width="16" height="16" type="image/x-icon">{WEBUI_URL}/favicon.png</Image>
-    <Url type="text/html" method="get" template="{WEBUI_URL}/?q={"{searchTerms}"}"/>
-    <moz:SearchForm>{WEBUI_URL}</moz:SearchForm>
-    </OpenSearchDescription>
-    """
-    return Response(content=xml_content, media_type="application/xml")
+        return StreamingResponse(
+            download_file_stream(url, form_data.url, file_path, file_name),
+        )
+    else:
+        return None
 
 
-@app.get("/health")
-async def healthcheck():
-    return {"status": True}
+@app.post("/models/upload")
+@app.post("/models/upload/{url_idx}")
+def upload_model(file: UploadFile = File(...), url_idx: Optional[int] = None):
+    if url_idx == None:
+        url_idx = 0
+    ollama_url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+
+    file_path = f"{UPLOAD_DIR}/{file.filename}"
+
+    # Save file in chunks
+    with open(file_path, "wb+") as f:
+        for chunk in file.file:
+            f.write(chunk)
+
+    def file_process_stream():
+        nonlocal ollama_url
+        total_size = os.path.getsize(file_path)
+        chunk_size = 1024 * 1024
+        try:
+            with open(file_path, "rb") as f:
+                total = 0
+                done = False
+
+                while not done:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        done = True
+                        continue
+
+                    total += len(chunk)
+                    progress = round((total / total_size) * 100, 2)
+
+                    res = {
+                        "progress": progress,
+                        "total": total_size,
+                        "completed": total,
+                    }
+                    yield f"data: {json.dumps(res)}\n\n"
+
+                if done:
+                    f.seek(0)
+                    hashed = calculate_sha256(f)
+                    f.seek(0)
+
+                    url = f"{ollama_url}/api/blobs/sha256:{hashed}"
+                    response = requests.post(url, data=f)
+
+                    if response.ok:
+                        res = {
+                            "done": done,
+                            "blob": f"sha256:{hashed}",
+                            "name": file.filename,
+                        }
+                        os.remove(file_path)
+                        yield f"data: {json.dumps(res)}\n\n"
+                    else:
+                        raise Exception(
+                            "Ollama: Could not create blob, Please try again."
+                        )
+
+        except Exception as e:
+            res = {"error": str(e)}
+            yield f"data: {json.dumps(res)}\n\n"
+
+    return StreamingResponse(file_process_stream(), media_type="text/event-stream")
 
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-app.mount("/cache", StaticFiles(directory=CACHE_DIR), name="cache")
+# async def upload_model(file: UploadFile = File(), url_idx: Optional[int] = None):
+#     if url_idx == None:
+#         url_idx = 0
+#     url = app.state.config.OLLAMA_BASE_URLS[url_idx]
 
-if os.path.exists(FRONTEND_BUILD_DIR):
-    mimetypes.add_type("text/javascript", ".js")
-    app.mount(
-        "/",
-        SPAStaticFiles(directory=FRONTEND_BUILD_DIR, html=True),
-        name="spa-static-files",
-    )
-else:
-    log.warning(
-        f"Frontend build directory not found at '{FRONTEND_BUILD_DIR}'. Serving API only."
-    )
+#     file_location = os.path.join(UPLOAD_DIR, file.filename)
+#     total_size = file.size
+
+#     async def file_upload_generator(file):
+#         print(file)
+#         try:
+#             async with aiofiles.open(file_location, "wb") as f:
+#                 completed_size = 0
+#                 while True:
+#                     chunk = await file.read(1024*1024)
+#                     if not chunk:
+#                         break
+#                     await f.write(chunk)
+#                     completed_size += len(chunk)
+#                     progress = (completed_size / total_size) * 100
+
+#                     print(progress)
+#                     yield f'data: {json.dumps({"status": "uploading", "percentage": progress, "total": total_size, "completed": completed_size, "done": False})}\n'
+#         except Exception as e:
+#             print(e)
+#             yield f"data: {json.dumps({'status': 'error', 'message': str(e)})}\n"
+#         finally:
+#             await file.close()
+#             print("done")
+#             yield f'data: {json.dumps({"status": "completed", "percentage": 100, "total": total_size, "completed": completed_size, "done": True})}\n'
+
+#     return StreamingResponse(
+#         file_upload_generator(copy.deepcopy(file)), media_type="text/event-stream"
+#     )
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def deprecated_proxy(
+    path: str, request: Request, user=Depends(get_verified_user)
+):
+    url = app.state.config.OLLAMA_BASE_URLS[0]
+    target_url = f"{url}/{path}"
+
+    body = await request.body()
+    headers = dict(request.headers)
+
+    if user.role in ["user", "admin"]:
+        if path in ["pull", "delete", "push", "copy", "create"]:
+            if user.role != "admin":
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+                )
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    headers.pop("host", None)
+    headers.pop("authorization", None)
+    headers.pop("origin", None)
+    headers.pop("referer", None)
+
+    r = None
+
+    def get_request():
+        nonlocal r
+
+        request_id = str(uuid.uuid4())
+        try:
+            REQUEST_POOL.append(request_id)
+
+            def stream_content():
+                try:
+                    if path == "generate":
+                        data = json.loads(body.decode("utf-8"))
+
+                        if data.get("stream", True):
+                            yield json.dumps({"id": request_id, "done": False}) + "\n"
+
+                    elif path == "chat":
+                        yield json.dumps({"id": request_id, "done": False}) + "\n"
+
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if request_id in REQUEST_POOL:
+                            yield chunk
+                        else:
+                            log.warning("User: canceled request")
+                            break
+                finally:
+                    if hasattr(r, "close"):
+                        r.close()
+                        if request_id in REQUEST_POOL:
+                            REQUEST_POOL.remove(request_id)
+
+            r = requests.request(
+                method=request.method,
+                url=target_url,
+                data=body,
+                headers=headers,
+                stream=True,
+            )
+
+            r.raise_for_status()
+
+            # r.close()
+
+            return StreamingResponse(
+                stream_content(),
+                status_code=r.status_code,
+                headers=dict(r.headers),
+            )
+        except Exception as e:
+            raise e
+
+    try:
+        return await run_in_threadpool(get_request)
+    except Exception as e:
+        error_detail = "Corp WebIntel: Server Connection Error"
+        if r is not None:
+            try:
+                res = r.json()
+                if "error" in res:
+                    error_detail = f"Ollama: {res['error']}"
+            except:
+                error_detail = f"Ollama: {e}"
+
+        raise HTTPException(
+            status_code=r.status_code if r else 500,
+            detail=error_detail,
+        )
