@@ -41,7 +41,6 @@ import validators
 import urllib.parse
 import socket
 
-
 from pydantic import BaseModel
 from typing import Optional
 import mimetypes
@@ -147,21 +146,18 @@ app.state.config.CHUNK_SIZE = CHUNK_SIZE
 app.state.config.CHUNK_OVERLAP = CHUNK_OVERLAP
 
 app.state.config.RAG_EMBEDDING_ENGINE = RAG_EMBEDDING_ENGINE
-app.state.config.RAG_EMBEDDING_MODEL = RAG_EMBEDDING_MODEL
+app.state.config.RAG_EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
 app.state.config.RAG_EMBEDDING_OPENAI_BATCH_SIZE = RAG_EMBEDDING_OPENAI_BATCH_SIZE
 app.state.config.RAG_RERANKING_MODEL = RAG_RERANKING_MODEL
 app.state.config.RAG_TEMPLATE = RAG_TEMPLATE
-
 
 app.state.config.OPENAI_API_BASE_URL = RAG_OPENAI_API_BASE_URL
 app.state.config.OPENAI_API_KEY = RAG_OPENAI_API_KEY
 
 app.state.config.PDF_EXTRACT_IMAGES = PDF_EXTRACT_IMAGES
 
-
 app.state.config.YOUTUBE_LOADER_LANGUAGE = YOUTUBE_LOADER_LANGUAGE
 app.state.YOUTUBE_LOADER_TRANSLATION = None
-
 
 app.state.config.ENABLE_RAG_WEB_SEARCH = ENABLE_RAG_WEB_SEARCH
 app.state.config.RAG_WEB_SEARCH_ENGINE = RAG_WEB_SEARCH_ENGINE
@@ -178,7 +174,6 @@ app.state.config.TAVILY_API_KEY = TAVILY_API_KEY
 app.state.config.RAG_WEB_SEARCH_RESULT_COUNT = RAG_WEB_SEARCH_RESULT_COUNT
 app.state.config.RAG_WEB_SEARCH_CONCURRENT_REQUESTS = RAG_WEB_SEARCH_CONCURRENT_REQUESTS
 
-
 def update_embedding_model(
     embedding_model: str,
     update_model: bool = False,
@@ -191,7 +186,6 @@ def update_embedding_model(
         )
     else:
         app.state.sentence_transformer_ef = None
-
 
 def update_reranking_model(
     reranking_model: str,
@@ -206,7 +200,6 @@ def update_reranking_model(
     else:
         app.state.sentence_transformer_rf = None
 
-
 update_embedding_model(
     app.state.config.RAG_EMBEDDING_MODEL,
     RAG_EMBEDDING_MODEL_AUTO_UPDATE,
@@ -216,7 +209,6 @@ update_reranking_model(
     app.state.config.RAG_RERANKING_MODEL,
     RAG_RERANKING_MODEL_AUTO_UPDATE,
 )
-
 
 app.state.EMBEDDING_FUNCTION = get_embedding_function(
     app.state.config.RAG_EMBEDDING_ENGINE,
@@ -229,7 +221,6 @@ app.state.EMBEDDING_FUNCTION = get_embedding_function(
 
 origins = ["*"]
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -238,18 +229,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 class CollectionNameForm(BaseModel):
     collection_name: Optional[str] = "test"
-
 
 class UrlForm(CollectionNameForm):
     url: str
 
-
 class SearchForm(CollectionNameForm):
     query: str
-
 
 @app.get("/")
 async def get_status():
@@ -264,7 +251,6 @@ async def get_status():
         "openai_batch_size": app.state.config.RAG_EMBEDDING_OPENAI_BATCH_SIZE,
     }
 
-
 @app.get("/embedding")
 async def get_embedding_config(user=Depends(get_admin_user)):
     return {
@@ -278,26 +264,22 @@ async def get_embedding_config(user=Depends(get_admin_user)):
         },
     }
 
-
 @app.get("/reranking")
-async def get_reraanking_config(user=Depends(get_admin_user)):
+async def get_reranking_config(user=Depends(get_admin_user)):
     return {
         "status": True,
         "reranking_model": app.state.config.RAG_RERANKING_MODEL,
     }
-
 
 class OpenAIConfigForm(BaseModel):
     url: str
     key: str
     batch_size: Optional[int] = None
 
-
 class EmbeddingModelUpdateForm(BaseModel):
     openai_config: Optional[OpenAIConfigForm] = None
     embedding_engine: str
     embedding_model: str
-
 
 @app.post("/embedding/update")
 async def update_embedding_config(
@@ -348,10 +330,8 @@ async def update_embedding_config(
             detail=ERROR_MESSAGES.DEFAULT(e),
         )
 
-
 class RerankingModelUpdateForm(BaseModel):
     reranking_model: str
-
 
 @app.post("/reranking/update")
 async def update_reranking_config(
@@ -375,7 +355,6 @@ async def update_reranking_config(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=ERROR_MESSAGES.DEFAULT(e),
         )
-
 
 @app.get("/config")
 async def get_rag_config(user=Depends(get_admin_user)):
@@ -410,16 +389,13 @@ async def get_rag_config(user=Depends(get_admin_user)):
         },
     }
 
-
 class ChunkParamUpdateForm(BaseModel):
     chunk_size: int
     chunk_overlap: int
 
-
 class YoutubeLoaderConfig(BaseModel):
     language: List[str]
     translation: Optional[str] = None
-
 
 class WebSearchConfig(BaseModel):
     enabled: bool
@@ -436,18 +412,15 @@ class WebSearchConfig(BaseModel):
     result_count: Optional[int] = None
     concurrent_requests: Optional[int] = None
 
-
 class WebConfig(BaseModel):
     search: WebSearchConfig
     web_loader_ssl_verification: Optional[bool] = None
-
 
 class ConfigUpdateForm(BaseModel):
     pdf_extract_images: Optional[bool] = None
     chunk: Optional[ChunkParamUpdateForm] = None
     youtube: Optional[YoutubeLoaderConfig] = None
     web: Optional[WebConfig] = None
-
 
 @app.post("/config/update")
 async def update_rag_config(form_data: ConfigUpdateForm, user=Depends(get_admin_user)):
@@ -521,14 +494,12 @@ async def update_rag_config(form_data: ConfigUpdateForm, user=Depends(get_admin_
         },
     }
 
-
 @app.get("/template")
 async def get_rag_template(user=Depends(get_current_user)):
     return {
         "status": True,
         "template": app.state.config.RAG_TEMPLATE,
     }
-
 
 @app.get("/query/settings")
 async def get_query_settings(user=Depends(get_admin_user)):
@@ -540,13 +511,11 @@ async def get_query_settings(user=Depends(get_admin_user)):
         "hybrid": app.state.config.ENABLE_RAG_HYBRID_SEARCH,
     }
 
-
 class QuerySettingsForm(BaseModel):
     k: Optional[int] = None
     r: Optional[float] = None
     template: Optional[str] = None
     hybrid: Optional[bool] = None
-
 
 @app.post("/query/settings/update")
 async def update_query_settings(
@@ -568,14 +537,12 @@ async def update_query_settings(
         "hybrid": app.state.config.ENABLE_RAG_HYBRID_SEARCH,
     }
 
-
 class QueryDocForm(BaseModel):
     collection_name: str
     query: str
     k: Optional[int] = None
     r: Optional[float] = None
     hybrid: Optional[bool] = None
-
 
 @app.post("/query/doc")
 def query_doc_handler(
@@ -608,14 +575,12 @@ def query_doc_handler(
             detail=ERROR_MESSAGES.DEFAULT(e),
         )
 
-
 class QueryCollectionsForm(BaseModel):
     collection_names: List[str]
     query: str
     k: Optional[int] = None
     r: Optional[float] = None
     hybrid: Optional[bool] = None
-
 
 @app.post("/query/collection")
 def query_collection_handler(
@@ -649,7 +614,6 @@ def query_collection_handler(
             detail=ERROR_MESSAGES.DEFAULT(e),
         )
 
-
 @app.post("/youtube")
 def store_youtube_video(form_data: UrlForm, user=Depends(get_current_user)):
     try:
@@ -678,7 +642,6 @@ def store_youtube_video(form_data: UrlForm, user=Depends(get_current_user)):
             detail=ERROR_MESSAGES.DEFAULT(e),
         )
 
-
 @app.post("/web")
 def store_web(form_data: UrlForm, user=Depends(get_current_user)):
     # "https://www.gutenberg.org/files/1727/1727-h/1727-h.htm"
@@ -706,7 +669,6 @@ def store_web(form_data: UrlForm, user=Depends(get_current_user)):
             detail=ERROR_MESSAGES.DEFAULT(e),
         )
 
-
 def get_web_loader(url: Union[str, Sequence[str]], verify_ssl: bool = True):
     # Check if the URL is valid
     if not validate_url(url):
@@ -717,7 +679,6 @@ def get_web_loader(url: Union[str, Sequence[str]], verify_ssl: bool = True):
         requests_per_second=RAG_WEB_SEARCH_CONCURRENT_REQUESTS,
         continue_on_failure=True,
     )
-
 
 def validate_url(url: Union[str, Sequence[str]]):
     if isinstance(url, str):
@@ -742,7 +703,6 @@ def validate_url(url: Union[str, Sequence[str]]):
     else:
         return False
 
-
 def resolve_hostname(hostname):
     # Get address information
     addr_info = socket.getaddrinfo(hostname, None)
@@ -752,7 +712,6 @@ def resolve_hostname(hostname):
     ipv6_addresses = [info[4][0] for info in addr_info if info[0] == socket.AF_INET6]
 
     return ipv4_addresses, ipv6_addresses
-
 
 def search_web(engine: str, query: str) -> list[SearchResult]:
     """Search the web using a search engine and return the results as a list of SearchResult objects.
@@ -844,7 +803,6 @@ def search_web(engine: str, query: str) -> list[SearchResult]:
     else:
         raise Exception("No search engine API key found in environment variables")
 
-
 @app.post("/web/search")
 def store_web_search(form_data: SearchForm, user=Depends(get_current_user)):
     try:
@@ -885,7 +843,6 @@ def store_web_search(form_data: SearchForm, user=Depends(get_current_user)):
             detail=ERROR_MESSAGES.DEFAULT(e),
         )
 
-
 def store_data_in_vector_db(data, collection_name, overwrite: bool = False) -> bool:
 
     text_splitter = RecursiveCharacterTextSplitter(
@@ -902,7 +859,6 @@ def store_data_in_vector_db(data, collection_name, overwrite: bool = False) -> b
     else:
         raise ValueError(ERROR_MESSAGES.EMPTY_CONTENT)
 
-
 def store_text_in_vector_db(
     text, metadata, collection_name, overwrite: bool = False
 ) -> bool:
@@ -914,8 +870,7 @@ def store_text_in_vector_db(
     docs = text_splitter.create_documents([text], metadatas=[metadata])
     return store_docs_in_vector_db(docs, collection_name, overwrite)
 
-
-def store_docs_in_vector_db(docs, collection_name, overwrite: bool = False) -> bool:
+def store_docs_in_vector_db(docs, collection_name, overwrite: bool = False) -> bool {
     log.info(f"store_docs_in_vector_db {docs} {collection_name}")
 
     texts = [doc.page_content for doc in docs]
@@ -965,7 +920,6 @@ def store_docs_in_vector_db(docs, collection_name, overwrite: bool = False) -> b
             return True
 
         return False
-
 
 def get_loader(filename: str, file_content_type: str, file_path: str):
     file_ext = filename.split(".")[-1].lower()
@@ -1061,7 +1015,6 @@ def get_loader(filename: str, file_content_type: str, file_path: str):
 
     return loader, known_type
 
-
 @app.post("/doc")
 def store_doc(
     collection_name: Optional[str] = Form(None),
@@ -1118,12 +1071,10 @@ def store_doc(
                 detail=ERROR_MESSAGES.DEFAULT(e),
             )
 
-
 class TextRAGForm(BaseModel):
     name: str
     content: str
     collection_name: Optional[str] = None
-
 
 @app.post("/text")
 def store_text(
@@ -1148,7 +1099,6 @@ def store_text(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=ERROR_MESSAGES.DEFAULT(),
         )
-
 
 @app.get("/scan")
 def scan_docs_dir(user=Depends(get_admin_user)):
@@ -1210,11 +1160,9 @@ def scan_docs_dir(user=Depends(get_admin_user)):
 
     return True
 
-
 @app.get("/reset/db")
 def reset_vector_db(user=Depends(get_admin_user)):
     CHROMA_CLIENT.reset()
-
 
 @app.get("/reset/uploads")
 def reset_upload_dir(user=Depends(get_admin_user)) -> bool:
@@ -1239,7 +1187,6 @@ def reset_upload_dir(user=Depends(get_admin_user)) -> bool:
 
     return True
 
-
 @app.get("/reset")
 def reset(user=Depends(get_admin_user)) -> bool:
     folder = f"{UPLOAD_DIR}"
@@ -1259,7 +1206,6 @@ def reset(user=Depends(get_admin_user)) -> bool:
         log.exception(e)
 
     return True
-
 
 class SafeWebBaseLoader(WebBaseLoader):
     """WebBaseLoader with enhanced error handling for URLs."""
@@ -1286,7 +1232,6 @@ class SafeWebBaseLoader(WebBaseLoader):
             except Exception as e:
                 # Log the error and continue with the next URL
                 log.error(f"Error loading {path}: {e}")
-
 
 if ENV == "dev":
 
